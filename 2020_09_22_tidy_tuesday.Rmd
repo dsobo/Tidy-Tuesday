@@ -2,6 +2,8 @@
 title: "TidyTemplate"
 date: 2020-09-23
 output: html_output
+editor_options: 
+  chunk_output_type: console
 ---
 
 # TidyTuesday
@@ -143,7 +145,7 @@ glmnet_recipe <-
   step_dummy(all_nominal(), -all_outcomes()) %>% 
   step_zv(all_predictors()) %>% 
   step_normalize(all_predictors(), -all_nominal()) %>%
-  step_upsample(died)
+  step_smote(died)
 
 
 glmnet_spec <- 
@@ -156,13 +158,14 @@ glmnet_workflow <-
   add_recipe(glmnet_recipe) %>% 
   add_model(glmnet_spec) 
 
+
+
 glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20), 
                                mixture = c(0.05, 0.2, 0.4, 0.6, 0.8, 1)) 
 
 
-parallel::detectCores(logical = FALSE)
 
-before_loaded <- names(sessionInfo()$otherPkgs)
+
 
 library(doParallel)
 cl <- makeCluster(3)
@@ -176,15 +179,17 @@ glmnet_tune <-
             control = control_grid(save_pred = TRUE)) 
 
 stopCluster(cl)
-registerDoSEQ()
+
 
 
 autoplot(glmnet_tune)
 
 best_glmnet <-  select_best(glmnet_tune, metric = "roc_auc")
 
-collect_predictions(glmnet_tune) %>%
-  inner_join(best_glmnet, by = c("penalty","mixture"))
+best_metrics_glmnet <- collect_metrics(glmnet_tune) %>%
+  inner_join(best_glmnet, by = c("penalty","mixture")) %>%
+  select(.metric,mean, std_err) %>%
+  mutate(model = "glmnet")
 
 glmnet_pred <- collect_predictions(glmnet_tune) %>%
   inner_join(best_glmnet, by = c("penalty","mixture")) 
@@ -235,7 +240,7 @@ ranger_grid <- grid_max_entropy(min_n(), finalize(mtry(), climbers_train), size 
 
 set.seed(60402)
 
-library(doParallel)
+
 cl <- makeCluster(3)
 registerDoParallel(cl)
 
@@ -247,7 +252,7 @@ ranger_tune <-
 
 
 stopCluster(cl)
-registerDoSEQ()
+
 
 ranger_tune %>%
   collect_metrics() %>%
@@ -258,6 +263,13 @@ autoplot(ranger_tune)
 ## Get best model and perform resampling
 
 best_ranger <-  select_best(ranger_tune, metric = "roc_auc")
+
+best_metrics_ranger <- ranger_tune %>%
+  collect_metrics() %>%
+  inner_join(best_ranger, by = c("min_n", "mtry")) %>%
+  select(.metric,mean, std_err) %>%
+  mutate(model = "ranger")
+
 
 ranger_pred <- collect_predictions(ranger_tune) %>%
   inner_join(best_ranger, by = c("min_n", "mtry")) 
@@ -271,7 +283,7 @@ ranger_pred %>%
   conf_mat(died, .pred_class)
 
 
-
+save.image(file = "modeling.RData")
 ```
 
 
@@ -288,7 +300,7 @@ earth_recipe <-
   step_novel(all_nominal(), -all_outcomes()) %>% 
   step_dummy(all_nominal(), -all_outcomes()) %>% 
   step_zv(all_predictors()) %>%
-  step_smote(died)
+  step_upsample(died)
 
 
 earth_spec <- 
@@ -305,7 +317,7 @@ earth_grid <- tidyr::crossing(num_terms = 2 * (1:6),
                               prod_degree = 1:2) 
 
 
-library(doParallel)
+
 cl <- makeCluster(4)
 registerDoParallel(cl)
 
@@ -316,7 +328,6 @@ earth_tune <-
             control = control_grid(save_pred = T)) 
 
 stopCluster(cl)
-registerDoSEQ()
 
 collect_metrics(earth_tune) %>%
   arrange(desc(mean))
@@ -324,6 +335,12 @@ collect_metrics(earth_tune) %>%
 autoplot(earth_tune)
 
 best_earth <-  select_best(earth_tune, metric = "roc_auc")
+
+best_metrics_earth <- collect_metrics(earth_tune) %>%
+  inner_join(best_earth, by = c("num_terms", "prod_degree")) %>%
+  select(.metric,mean,std_err) %>%
+  mutate(model = "earth")
+
 
 earth_pred <- collect_predictions(earth_tune) %>%
   inner_join(best_earth, by = c("num_terms", "prod_degree")) 
@@ -379,13 +396,13 @@ xgboost_tune <-
   tune_grid(xgboost_workflow, 
             resamples = climber_folds, 
             grid = xgboost_grid,
-            ctrl = control_grid(save_pred = T))
+            ctrl = control_grid(save_pred = TRUE))
 
 
 stopCluster(cl)
-registerDoSEQ()
 
-save.image(file = "climbers_tidymodels.RData")
+
+
 
 
 collect_metrics(xgboost_tune) %>%
@@ -395,16 +412,71 @@ autoplot(xgboost_tune)
 
 best_xgboost <-  select_best(xgboost_tune, metric = "roc_auc")
 
-xgboost_pred <- collect_predictions(xgboost_tune) %>%
-  inner_join(best_xgboost, by = c("num_terms", "prod_degree")) 
+best_metrics_xgboost <- collect_metrics(xgboost_tune) %>%
+    inner_join(best_xgboost, by = c("mtry", "min_n", "tree_depth", "learn_rate", "loss_reduction", "sample_size")) %>%
+    select(.metric,mean, std_err) %>%
+    mutate(model = "xgboost")
 
-xgboost_pred %>%
+
+xgboost_final <- finalize_model(
+  xgboost_spec,
+  best_xgboost)
+
+unregister <- function() {
+  env <- foreach:::.foreachGlobals
+  rm(list=ls(name=env), pos=env)
+}
+
+unregister()
+
+
+
+xgboost_rs <- xgboost_workflow %>%
+  update_model(xgboost_final) %>%
+  fit_resamples(
+    resamples = climber_folds,
+    control = control_resamples(save_pred = T)
+    )
+
+
+collect_predictions(xgboost_rs) %>%
   group_by(id) %>%
   roc_curve(died, .pred_died) %>%
   autoplot()
 
-xgboost_pred %>%
+
+collect_predictions(xgboost_rs) %>%
   conf_mat(died, .pred_class)
+
+save.image(file = "climbers_tidymodels.RData")
+
+```
+
+
+```{r}
+
+metrics <- best_metrics_earth %>%
+  bind_rows(best_metrics_glmnet) %>%
+  bind_rows(best_metrics_ranger) %>%
+  bind_rows(best_metrics_xgboost)
+
+metrics %>%
+  ggplot(aes(x = mean, y = model)) +
+  geom_point(size   = 2, alpha = .8) +
+  geom_errorbar(aes(xmin = mean - std_err, xmax = mean + std_err), width = .2, size = 1, alpha = .8) +
+  facet_wrap(~.metric)
+  
+  ?geom_errorbarh()
+
+final_result <- xgboost_workflow %>%
+  update_model(xgboost_final) %>%
+  last_fit(climbers_split)
+
+collect_metrics(final_result)
+
+collect_predictions(final_result) %>%
+  conf_mat(died, .pred_class)
+  
 
 ```
 
